@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" width="192" height="192">
+  <rect width="192" height="192" rx="40" fill="#0f0f0f"/>
+  <text x="96" y="120" font-size="80" text-anchor="middle" font-family="system-ui">💸</text>
+  <rect x="20" y="148" width="152" height="22" rx="6" fill="#c8f135"/>
+  <text x="96" y="165" font-size="13" text-anchor="middle" font-family="system-ui, sans-serif" font-weight="700" fill="#0f0f0f">MASROOF</text>
+</svg>

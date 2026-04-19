@@ -164,6 +164,16 @@
     .qbtn-dot{position:absolute;top:-3px;right:-3px;width:6px;height:6px;border-radius:50%;background:var(--lime)}
     /* recommendation insight */
     .insight{background:var(--amber-d);border:0.5px solid rgba(255,184,79,.2);border-radius:var(--rs);padding:9px 12px;margin-bottom:8px;font-size:12px;color:var(--amber);line-height:1.5}
+    /* supabase status */
+    .supa-ok{background:var(--green-d);color:var(--green)}
+    .supa-err{background:var(--red-d);color:var(--red)}
+    .supa-info{background:var(--blue-d);color:var(--blue)}
+    .sync-dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px;vertical-align:middle}
+    .sync-dot.ok{background:var(--green)}
+    .sync-dot.off{background:var(--t3)}
+    .sync-dot.spin{background:var(--amber);animation:pulse .8s infinite}
+    .sync-dot.err{background:var(--red)}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
     ::-webkit-scrollbar{width:0}
   </style>
 </head>
@@ -174,6 +184,7 @@
       <div>
         <div class="hdr-name">Ma<span>sroo</span>f</div>
         <div class="hdr-sub" id="hdr-sub">Loading...</div>
+        <div id="sync-status" style="font-size:10px;margin-top:3px;display:none"></div>
       </div>
       <div class="hdr-total">
         <div class="hdr-tlabel">Wants spent</div>
@@ -369,7 +380,29 @@
 
     <!-- SETTINGS -->
     <div class="page" id="page-settings">
-      <div class="card">
+      <div class="card" id="supa-card">
+        <div class="card-title">☁️ Supabase sync</div>
+        <div class="frow">
+          <div class="flabel">Project URL</div>
+          <input class="finput" type="url" id="supa-url" placeholder="https://xxxx.supabase.co" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="frow">
+          <div class="flabel">Anon / public key</div>
+          <input class="finput" type="password" id="supa-key" placeholder="eyJ…" autocomplete="off" spellcheck="false">
+        </div>
+        <div style="display:flex;gap:8px;margin-bottom:4px">
+          <button class="save-settings-btn" style="flex:1;margin-top:0" onclick="saveSupaConfig()">Save &amp; connect</button>
+          <button class="save-settings-btn" style="flex:0 0 auto;width:auto;padding:12px 16px;margin-top:0;background:var(--s3);color:var(--t1)" onclick="testSupaConnection()">Test</button>
+        </div>
+        <div id="supa-status" style="font-size:12px;margin-top:10px;padding:9px 12px;border-radius:var(--rs);display:none"></div>
+        <div style="margin-top:12px;border-top:0.5px solid var(--b1);padding-top:12px;display:flex;gap:8px">
+          <button class="save-settings-btn" style="flex:1;margin-top:0;background:var(--blue);color:#fff" onclick="syncToSupabase(true)">⬆ Push local → cloud</button>
+          <button class="save-settings-btn" style="flex:1;margin-top:0;background:var(--s3);color:var(--t1)" onclick="pullFromSupabase()">⬇ Pull cloud → local</button>
+        </div>
+        <div style="font-size:11px;color:var(--t3);margin-top:10px;line-height:1.6">
+          Data syncs automatically on every add/edit/delete once connected. Push/Pull let you force a full sync manually — useful when switching devices.
+        </div>
+      </div>
         <div class="card-title">Monthly budget caps</div>
         <div class="srow">
           <div class="srow-left">
@@ -551,10 +584,225 @@ function saveState(){
   localStorage.setItem('ms_sf',JSON.stringify(sfLog));
   localStorage.setItem('ms_wish',JSON.stringify(wishlist));
   localStorage.setItem('ms_goal',JSON.stringify(goalData));
+  scheduleSync();
 }
 loadState();
 
-function fmt(n){return Math.round(n).toLocaleString('en-EG');}
+// ═══════════════════════════════════════════════
+// SUPABASE SYNC ENGINE
+// ═══════════════════════════════════════════════
+let SUPA_URL='', SUPA_KEY='', SUPA_USER_ID='';
+
+function supaInit(){
+  SUPA_URL=(localStorage.getItem('ms_supa_url')||'').replace(/\/$/,'');
+  SUPA_KEY=localStorage.getItem('ms_supa_key')||'';
+  // stable device ID — generated once, never changes
+  if(!localStorage.getItem('ms_uid')){
+    localStorage.setItem('ms_uid','uid_'+Math.random().toString(36).slice(2)+Date.now().toString(36));
+  }
+  SUPA_USER_ID=localStorage.getItem('ms_uid');
+}
+supaInit();
+
+function supaReady(){return !!(SUPA_URL&&SUPA_KEY);}
+
+function setSyncStatus(state,text){
+  const el=document.getElementById('sync-status');
+  if(!supaReady()){el.style.display='none';return;}
+  el.style.display='block';
+  el.innerHTML=`<span class="sync-dot ${state}"></span>${text}`;
+  el.style.color=state==='ok'?'var(--green)':state==='err'?'var(--red)':state==='spin'?'var(--amber)':'var(--t3)';
+}
+
+async function supaFetch(table,method,body,matchId){
+  if(!supaReady())return null;
+  let url=`${SUPA_URL}/rest/v1/${table}`;
+  if(matchId!==undefined)url+=`?id=eq.${matchId}&user_id=eq.${encodeURIComponent(SUPA_USER_ID)}`;
+  else if(method==='GET')url+=`?user_id=eq.${encodeURIComponent(SUPA_USER_ID)}&order=date.asc&limit=5000`;
+  const opts={
+    method,
+    headers:{
+      'apikey':SUPA_KEY,
+      'Authorization':'Bearer '+SUPA_KEY,
+      'Content-Type':'application/json',
+      'Prefer': method==='POST'?'resolution=merge-duplicates':'',
+    }
+  };
+  if(body)opts.body=JSON.stringify(body);
+  try{
+    const r=await fetch(url,opts);
+    if(!r.ok){const t=await r.text();throw new Error(r.status+': '+t.slice(0,120));}
+    if(method==='GET')return await r.json();
+    return true;
+  }catch(e){
+    console.error('Supabase',method,table,e.message);
+    setSyncStatus('err','Sync error');
+    return null;
+  }
+}
+
+async function supaUpsertAppState(){
+  if(!supaReady())return;
+  const row={
+    user_id:SUPA_USER_ID,
+    goal_saved:goalData.saved,
+    goal_monthly:goalData.monthly,
+    budget_needs:BUDGET.needs,
+    budget_wants:BUDGET.wants,
+    budget_sinking:BUDGET.sinking,
+    cat_mapping:catMapping,
+    quick_items:quickItems,
+    updated_at:new Date().toISOString()
+  };
+  await supaFetch('app_state','POST',row);
+}
+
+// Write one expense row
+async function supaUpsertExpense(e){
+  if(!supaReady())return;
+  const row={id:e.id,user_id:SUPA_USER_ID,name:e.name,amount:e.amount,cat:e.cat,cat_label:e.catLabel,nw:e.nw,type:e.type,date:e.date};
+  await supaFetch('expenses','POST',row);
+}
+async function supaDeleteExpense(id){
+  if(!supaReady())return;
+  await supaFetch('expenses','DELETE',null,id);
+}
+
+// Write one sf_log row
+async function supaUpsertSfLog(e){
+  if(!supaReady())return;
+  const row={id:e.id,user_id:SUPA_USER_ID,name:e.name||'',amount:e.amount,type:e.type,date:e.date};
+  await supaFetch('sf_log','POST',row);
+}
+async function supaDeleteSfLog(id){
+  if(!supaReady())return;
+  await supaFetch('sf_log','DELETE',null,id);
+}
+
+// Upsert full wishlist (replace all)
+async function supaUpsertWishlist(){
+  if(!supaReady())return;
+  // delete all then insert fresh (wishlist is small)
+  await fetch(`${SUPA_URL}/rest/v1/wishlist?user_id=eq.${encodeURIComponent(SUPA_USER_ID)}`,{
+    method:'DELETE',headers:{'apikey':SUPA_KEY,'Authorization':'Bearer '+SUPA_KEY}
+  });
+  if(wishlist.length===0)return;
+  const rows=wishlist.map(w=>({id:w.id,user_id:SUPA_USER_ID,name:w.name,cost:w.cost||0,done:w.done||false}));
+  await supaFetch('wishlist','POST',rows);
+}
+
+// ── Push ALL local data to Supabase (full sync) ──
+async function syncToSupabase(silent=false){
+  if(!supaReady()){if(!silent)flash('Set Supabase credentials first','var(--amber)');return;}
+  setSyncStatus('spin','Syncing…');
+  try{
+    // Batch upsert expenses
+    if(expenses.length>0){
+      const rows=expenses.map(e=>({id:e.id,user_id:SUPA_USER_ID,name:e.name,amount:e.amount,cat:e.cat,cat_label:e.catLabel,nw:e.nw,type:e.type,date:e.date}));
+      await supaFetch('expenses','POST',rows);
+    }
+    // Batch upsert sf_log
+    if(sfLog.length>0){
+      const rows=sfLog.map(e=>({id:e.id,user_id:SUPA_USER_ID,name:e.name||'',amount:e.amount,type:e.type,date:e.date}));
+      await supaFetch('sf_log','POST',rows);
+    }
+    await supaUpsertWishlist();
+    await supaUpsertAppState();
+    const t=new Date().toLocaleTimeString('en-EG',{hour:'2-digit',minute:'2-digit'});
+    setSyncStatus('ok','Synced '+t);
+    localStorage.setItem('ms_last_sync',new Date().toISOString());
+    if(!silent)flash('Pushed to Supabase ✓','var(--green)');
+  }catch(e){
+    setSyncStatus('err','Sync failed');
+    if(!silent)flash('Sync failed: '+e.message,'var(--red)');
+  }
+}
+
+// ── Pull ALL cloud data to local (full restore) ──
+async function pullFromSupabase(){
+  if(!supaReady()){flash('Set Supabase credentials first','var(--amber)');return;}
+  setSyncStatus('spin','Pulling…');
+  try{
+    const [remExp,remSf,remWish,remState]=await Promise.all([
+      supaFetch('expenses','GET'),
+      supaFetch('sf_log','GET'),
+      supaFetch('wishlist','GET'),
+      fetch(`${SUPA_URL}/rest/v1/app_state?user_id=eq.${encodeURIComponent(SUPA_USER_ID)}`,{
+        headers:{'apikey':SUPA_KEY,'Authorization':'Bearer '+SUPA_KEY}
+      }).then(r=>r.json())
+    ]);
+
+    if(remExp)expenses=remExp.map(e=>({id:e.id,name:e.name,amount:e.amount,cat:e.cat,catLabel:e.cat_label,nw:e.nw,type:e.type,date:e.date}));
+    if(remSf)sfLog=remSf.map(e=>({id:e.id,name:e.name,amount:e.amount,type:e.type,date:e.date}));
+    if(remWish)wishlist=remWish.map(w=>({id:w.id,name:w.name,cost:w.cost,done:w.done}));
+    if(remState&&remState[0]){
+      const s=remState[0];
+      goalData={saved:s.goal_saved||0,monthly:s.goal_monthly||6000};
+      BUDGET.needs=s.budget_needs||3500;
+      BUDGET.wants=s.budget_wants||2000;
+      BUDGET.sinking=s.budget_sinking||3000;
+      if(s.cat_mapping)catMapping=s.cat_mapping;
+      if(s.quick_items&&s.quick_items.length>0)quickItems=s.quick_items;
+    }
+    saveState();
+    localStorage.setItem('ms_budget',JSON.stringify(BUDGET));
+    localStorage.setItem('ms_catmap',JSON.stringify(catMapping));
+    localStorage.setItem('ms_quick',JSON.stringify(quickItems));
+    const t=new Date().toLocaleTimeString('en-EG',{hour:'2-digit',minute:'2-digit'});
+    setSyncStatus('ok','Synced '+t);
+    flash('Pulled from Supabase ✓','var(--green)');
+    renderHome();
+  }catch(e){
+    setSyncStatus('err','Pull failed');
+    flash('Pull failed: '+e.message,'var(--red)');
+  }
+}
+
+// ── Test connection ──
+async function testSupaConnection(){
+  const url=(document.getElementById('supa-url').value||'').trim().replace(/\/$/,'');
+  const key=(document.getElementById('supa-key').value||'').trim();
+  const statusEl=document.getElementById('supa-status');
+  statusEl.style.display='block';
+  statusEl.className='supa-info';statusEl.textContent='Testing connection…';
+  try{
+    const r=await fetch(`${url}/rest/v1/app_state?limit=1`,{
+      headers:{'apikey':key,'Authorization':'Bearer '+key}
+    });
+    if(r.ok){
+      statusEl.className='supa-ok';statusEl.textContent='✓ Connected successfully! Tables found.';
+    } else {
+      const t=await r.text();
+      statusEl.className='supa-err';statusEl.textContent='✗ Error '+r.status+': '+t.slice(0,100);
+    }
+  }catch(e){
+    statusEl.className='supa-err';statusEl.textContent='✗ Cannot reach URL. Check project URL and key.';
+  }
+}
+
+// ── Save Supabase config ──
+function saveSupaConfig(){
+  const url=(document.getElementById('supa-url').value||'').trim().replace(/\/$/,'');
+  const key=(document.getElementById('supa-key').value||'').trim();
+  if(!url||!key){flash('Enter both URL and key','var(--amber)');return;}
+  localStorage.setItem('ms_supa_url',url);
+  localStorage.setItem('ms_supa_key',key);
+  supaInit();
+  flash('Supabase config saved!','var(--green)');
+  setSyncStatus('ok','Ready');
+  document.getElementById('supa-status').style.display='none';
+}
+
+// ── Auto-sync wrapper: called after every write ──
+let syncTimer=null;
+function scheduleSync(){
+  if(!supaReady())return;
+  clearTimeout(syncTimer);
+  setSyncStatus('spin','Saving…');
+  syncTimer=setTimeout(()=>syncToSupabase(true),1200);
+}
+
+{return Math.round(n).toLocaleString('en-EG');}
 function nowDate(){const d=new Date();return{m:d.getMonth(),y:d.getFullYear()};}
 function monthExp(m,y){return expenses.filter(e=>{const d=new Date(e.date);return d.getMonth()===m&&d.getFullYear()===y;});}
 // Resolve needs/wants for a category emoji, respecting user override
@@ -681,7 +929,7 @@ function renderHome(){
   });
 }
 
-function delExp(id){expenses=expenses.filter(e=>e.id!==id);saveState();renderHome();}
+function delExp(id){supaDeleteExpense(id);expenses=expenses.filter(e=>e.id!==id);saveState();renderHome();}
 document.getElementById('clear-btn').onclick=()=>{
   const{m,y}=nowDate();
   if(confirm('Clear all expenses for '+MONTHS[m]+'?')){
@@ -812,7 +1060,9 @@ function renderGoals(){
 }
 function saveGoal(){
   goalData={saved:parseFloat(document.getElementById('goal-inp').value)||0,monthly:parseFloat(document.getElementById('goal-m-inp').value)||6000};
-  saveState();renderGoals();flash('Goal updated!','var(--green)');
+  saveState();
+  supaUpsertAppState();
+  renderGoals();flash('Goal updated!','var(--green)');
 }
 
 // Export
@@ -873,6 +1123,9 @@ function renderSettings(){
   document.getElementById('set-needs').value=BUDGET.needs;
   document.getElementById('set-wants').value=BUDGET.wants;
   document.getElementById('set-sinking').value=BUDGET.sinking;
+  // pre-fill Supabase fields
+  document.getElementById('supa-url').value=localStorage.getItem('ms_supa_url')||'';
+  document.getElementById('supa-key').value=localStorage.getItem('ms_supa_key')||'';
 
   // QA preview
   refreshQuickItems();
@@ -924,6 +1177,7 @@ function saveSettings(){
   if(!n||!w||!s||isNaN(n)||isNaN(w)||isNaN(s)){flash('Enter valid numbers for all caps');return;}
   BUDGET.needs=n;BUDGET.wants=w;BUDGET.sinking=s;
   localStorage.setItem('ms_budget',JSON.stringify(BUDGET));
+  supaUpsertAppState();
   flash('Budget caps saved!','var(--green)');
   renderSettings();
 }
@@ -934,6 +1188,7 @@ function saveCatMapping(){
     if(el)catMapping[c.e]=el.value;
   });
   localStorage.setItem('ms_catmap',JSON.stringify(catMapping));
+  supaUpsertAppState();
   flash('Category mapping saved!','var(--green)');
 }
 
@@ -959,6 +1214,16 @@ if(up.get('amount')){
 }
 
 renderHome();
+// Init sync status indicator
+if(supaReady()){
+  const last=localStorage.getItem('ms_last_sync');
+  if(last){
+    const t=new Date(last).toLocaleTimeString('en-EG',{hour:'2-digit',minute:'2-digit'});
+    setSyncStatus('ok','Last sync '+t);
+  }else{
+    setSyncStatus('off','Not synced yet');
+  }
+}
 </script>
 
 <!-- SF EDIT MODAL -->
@@ -1015,6 +1280,7 @@ function saveSfEdit(){
   sfLog[idx].amount=amount;
   if(date)sfLog[idx].date=new Date(date).toISOString();
   saveState();
+  supaUpsertSfLog(sfLog[idx]);
   document.getElementById('sf-modal').classList.remove('open');
   sfEditingId=null;
   flash('Transaction updated!','var(--green)');
@@ -1024,6 +1290,7 @@ function saveSfEdit(){
 function deleteSfEntry(){
   if(!sfEditingId)return;
   if(!confirm('Delete this transaction?'))return;
+  supaDeleteSfLog(sfEditingId);
   sfLog=sfLog.filter(e=>e.id!==sfEditingId);
   saveState();
   document.getElementById('sf-modal').classList.remove('open');
